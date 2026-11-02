@@ -503,12 +503,15 @@ def run_etl(trigger_type: str = "manual") -> Dict[str, Any]:
     try:
         init_db(engine)
     except Exception as e:
-        logger.error(f"Failed to verify/initialize database schema: {e}")
+        err_msg = str(e)
+        if ("127.0.0.1" in err_msg or "localhost" in err_msg) and not settings.DATABASE_URL:
+            err_msg += " (Hint: Database host is defaulting to 127.0.0.1/localhost. Please configure DATABASE_URL or DB_HOST, DB_USER, DB_PASSWORD in Render Dashboard -> Environment tab)."
+        logger.error(f"Failed to verify/initialize database schema: {err_msg}")
         return {
             "run_id": run_id,
             "status": "FAILED",
             "trigger_type": trigger_type,
-            "error": f"Database initialization error: {str(e)}",
+            "error": f"Database initialization error: {err_msg}",
             "duration_seconds": round(time.time() - start_time, 2),
         }
 
