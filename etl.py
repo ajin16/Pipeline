@@ -14,6 +14,7 @@ Architecture:
 from __future__ import annotations
 
 import logging
+import math
 import sys
 import time
 import uuid
@@ -27,6 +28,7 @@ from sqlalchemy import (
     Column,
     DateTime,
     Float,
+    Index,
     Integer,
     MetaData,
     SmallInteger,
@@ -67,16 +69,17 @@ weather_hourly_table = Table(
     "weather_hourly",
     metadata,
     Column("id", Integer, primary_key=True, autoincrement=True),
-    Column("city_name", String(64), nullable=False),
+    Column("city_name", String(64), nullable=False, index=True),
     Column("latitude", DECIMAL(8, 5), nullable=False),
     Column("longitude", DECIMAL(8, 5), nullable=False),
-    Column("recorded_at", DateTime, nullable=False),
+    Column("recorded_at", DateTime, nullable=False, index=True),
     Column("temperature_2m", Float, nullable=True),
     Column("relative_humidity_2m", SmallInteger, nullable=True),
     Column("precipitation", Float, nullable=True),
     Column("extracted_at", DateTime, server_default=func.now(), nullable=False),
     Column("updated_at", DateTime, server_default=func.now(), onupdate=func.now(), nullable=False),
     UniqueConstraint("city_name", "recorded_at", name="uq_city_recorded"),
+    Index("idx_weather_city_time", "city_name", "recorded_at"),
 )
 
 etl_pipeline_runs_table = Table(
@@ -294,7 +297,7 @@ def transform_city_payload(
         if raw_temp is not None:
             try:
                 t = float(raw_temp)
-                if -90.0 <= t <= 70.0:
+                if not math.isnan(t) and not math.isinf(t) and -90.0 <= t <= 70.0:
                     valid_temp = round(t, 2)
             except (ValueError, TypeError):
                 valid_temp = None
@@ -304,9 +307,9 @@ def transform_city_payload(
         valid_hum: Optional[int] = None
         if raw_hum is not None:
             try:
-                h = int(round(float(raw_hum)))
-                if 0 <= h <= 100:
-                    valid_hum = h
+                h = float(raw_hum)
+                if not math.isnan(h) and not math.isinf(h) and 0.0 <= h <= 100.0:
+                    valid_hum = int(round(h))
             except (ValueError, TypeError):
                 valid_hum = None
 
@@ -316,7 +319,7 @@ def transform_city_payload(
         if raw_precip is not None:
             try:
                 p = float(raw_precip)
-                if p >= 0.0:
+                if not math.isnan(p) and not math.isinf(p) and p >= 0.0:
                     valid_precip = round(p, 2)
             except (ValueError, TypeError):
                 valid_precip = None
@@ -338,13 +341,19 @@ def transform_city_payload(
 def transform(raw_payloads: List[Tuple[CityConfig, Dict[str, Any]]]) -> List[Dict[str, Any]]:
     """
     Transforms raw JSON responses from all cities into normalized tabular records.
+    Deduplicates on (city_name, recorded_at) to prevent duplicate key conflicts within a batch.
     """
     logger.info(f"--- Starting Transform Phase: Processing {len(raw_payloads)} city payloads ---")
+    seen_keys = set()
     all_clean_records: List[Dict[str, Any]] = []
 
     for city, payload in raw_payloads:
         records = transform_city_payload(city, payload)
-        all_clean_records.extend(records)
+        for r in records:
+            key = (r["city_name"], r["recorded_at"])
+            if key not in seen_keys:
+                seen_keys.add(key)
+                all_clean_records.append(r)
         logger.debug(f"Transformed {len(records)} clean records for {city.name}.")
 
     logger.info(f"--- Transform Phase Complete: Total validated records: {len(all_clean_records)} ---")
@@ -525,6 +534,9 @@ def run_etl(trigger_type: str = "manual") -> Dict[str, Any]:
     try:
         # Phase 1: Extract
         raw_payloads = extract(target_cities)
+        if not raw_payloads:
+            raise RuntimeError("Extraction failed: could not fetch weather data from Open-Meteo for any target city.")
+
         for _, payload in raw_payloads:
             records_extracted += len(payload.get("hourly", {}).get("time", []))
 
